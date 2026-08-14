@@ -104,8 +104,9 @@ you switch the addendum on, measure your own efficiency delta with
 
 from __future__ import annotations
 
+import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
@@ -162,6 +163,10 @@ _PLACEHOLDER_RE = re.compile(r"\A[\s.…·\-–—]*\Z")
 #: (`arena.model._FINAL_RE`). Used ONLY to locate marker lines — every
 #: payload on this path is still decoded by `parse_output` itself.
 _FINAL_MARKER = "FINAL:"
+
+#: The frozen parser's ACTION marker (`arena.model._ACTION_RE`), used only
+#: to locate the line whose top-level keys `_with_flat_args` folds in.
+_ACTION_MARKER = "ACTION:"
 
 # ---------------------------------------------------------------------------
 # The real-model prompt addendum
@@ -373,6 +378,46 @@ def _without_quoted_finals(text: str) -> str:
                 continue
         kept.append(line)
     return "\n".join(kept) if dropped else text
+
+
+def _with_flat_args(text: str, parsed):
+    """One turn's ACTION args, with TOP-LEVEL keys folded in.
+
+    MEASURED ON A LIVE ENDPOINT, and it cost a whole run. `gpt-4o-mini`
+    writes the tool call FLAT::
+
+        ACTION: {"doc_id": "doc-0004", "tool": "fetch_doc"}
+
+    where the protocol asks for the argument nested under `args`. The
+    frozen `parse_output` keeps `tool` and `args` and DROPS every other
+    key, so `args` arrives empty, `fetch_doc("")` answers `doc not
+    found`, and the run reads as a retrieval failure. On `pub-01` the
+    model asked for the RIGHT document twice and got nothing both times:
+    5 of 8 tool calls wasted, zero claims, 29.26 instead of 100.00.
+
+    This is NORMALISATION, not a parser of our own — the same distinction
+    `_canonicalise` draws. `parse_output` still decides `kind` and
+    `tool`; nothing here can manufacture an action the frozen parser did
+    not already recognise, and a nested `args` always wins a conflict.
+    Claims never pass through here, so provenance is untouched.
+    """
+    if parsed.kind != "action":
+        return parsed
+    for line in text.split("\n"):
+        if not line.startswith(_ACTION_MARKER):
+            continue
+        try:
+            payload = json.loads(line[len(_ACTION_MARKER):].strip())
+        except Exception:
+            return parsed
+        if not isinstance(payload, dict):
+            return parsed
+        merged = {k: v for k, v in payload.items() if k not in ("tool", "args")}
+        if not merged:
+            return parsed
+        merged.update(parsed.args)  # nested `args` wins
+        return replace(parsed, args=merged)
+    return parsed
 
 
 def _action_under_final(text: str):
@@ -591,9 +636,10 @@ class ReActAgent:
         submitted if the run ends without a real FINAL, so a guard can
         only buy a turn, never lose a report.
         """
-        parsed = parse_output(_canonicalise(text))
+        canonical = _canonicalise(text)
+        parsed = parse_output(canonical)
         if parsed.kind != "final":
-            return parsed
+            return _with_flat_args(canonical, parsed)
 
         if _is_report_payload(parsed.final):
             action = _action_under_final(text)
@@ -601,7 +647,7 @@ class ReActAgent:
                 return parsed
             self._final_deferrals += 1
             self._refused_final = parsed.final
-            return action
+            return _with_flat_args(text, action)
 
         if isinstance(parsed.final, dict) and any(
             key in parsed.final for key in REPORT_KEYS
@@ -610,7 +656,7 @@ class ReActAgent:
         # Strict, NOT canonicalised: normalisation is what resurrects a
         # non-canonical marker such as `final: {}` in the first place, and
         # this path exists precisely to look underneath one.
-        return parse_output(_without_quoted_finals(text))
+        return _with_flat_args(text, parse_output(_without_quoted_finals(text)))
 
     # -- the model -----------------------------------------------------
 

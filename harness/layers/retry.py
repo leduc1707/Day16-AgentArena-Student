@@ -94,6 +94,27 @@ class Retry(Middleware):
         content = getattr(result, "content", "")
         return (not result.ok) or is_degraded(content if isinstance(content, str) else "")
 
+    @staticmethod
+    def _hopeless(result) -> bool:
+        """Hỏng vì THAM SỐ SAI, không phải vì đường truyền chập chờn.
+
+        Thử lại chỉ có tác dụng vì `arena/tools.py` khoá xác suất hỏng
+        theo `(seed, số thứ tự lượt gọi)`, nên lượt gọi lại rơi vào chỉ
+        số MỚI. Hai lỗi dưới đây KHÔNG đi qua cơ chế đó — chúng là hàm
+        thuần của chính tham số được truyền vào, nên lượt gọi lại hỏng y
+        hệt, chỉ khác là đã tiêu thêm một lượt ngân sách.
+
+        ĐO TRÊN MODEL THẬT, và nó tốn cả một lượt chạy: `gpt-4o-mini`
+        gửi `{"doc_id": ..., "tool": "fetch_doc"}` phẳng, agent đọc ra
+        doc_id rỗng, tool trả `doc not found`, và lớp này gọi lại ĐÚNG
+        tham số rỗng đó thêm hai lần nữa. 5 trên 8 lượt tool bị đốt cho
+        một lỗi đã hỏng ngay từ lần đầu.
+        """
+        error = getattr(result, "error", "") or ""
+        content = getattr(result, "content", "") or ""
+        blob = f"{error} {content}"
+        return "doc not found:" in blob or "invalid expression:" in blob
+
     def _out_of_budget(self, ctx) -> bool:
         """`budget_policy` KHÔNG cứu được ở đây: hook `wrap_tool_call` của
         nó bọc NGOÀI vòng lặp này nên chỉ thấy lượt gọi đầu tiên. Chỉ
@@ -107,6 +128,7 @@ class Retry(Middleware):
         while (
             attempts < self.max_attempts
             and self._broken(result)
+            and not self._hopeless(result)
             and not self._out_of_budget(ctx)
         ):
             # ĐÚNG name/args cũ: tầng công cụ khoá xác suất hỏng theo
