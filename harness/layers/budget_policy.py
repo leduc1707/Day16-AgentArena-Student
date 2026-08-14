@@ -87,23 +87,30 @@ class BudgetPolicy(Middleware):
         self.reserve = max(0, int(reserve))
 
     def _spent(self, ctx) -> bool:
-        # TODO (§3): 2 dòng — "ngân sách đã cạn đến phần dự trữ chưa?"
-        #  limit = ctx.max_tool_calls; None nghĩa là brief không đặt ngân
-        #  sách -> chưa bao giờ cạn. Ngược lại:
-        #  ctx.tools.calls >= limit - self.reserve
-        return False
+        limit = ctx.max_tool_calls
+        # `None` = brief không đặt ngân sách -> không bao giờ cạn.
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
 
     def before_model(self, ctx, messages):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn (`not self._spent(ctx)`) -> trả messages nguyên vẹn.
-        #  2. Ngược lại: trả về messages + [{"role": "user", "content": NUDGE}]
-        return messages  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not self._spent(ctx):
+            return messages
+        # `messages + [...]` chứ không `append`: agent áp dụng before_model
+        # lên một BẢN SAO của lịch sử, nên đây là lời nhắc cho ĐÚNG lượt này.
+        return messages + [{"role": "user", "content": NUDGE}]
 
     def wrap_tool_call(self, ctx, call, name, args):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn -> `return call(name, args)` như bình thường.
-        #  2. Nếu đã cạn -> ĐỪNG gọi `call(...)`, trả về
-        #     ToolResult(ok=False, content="", error="<lý do>").
-        #     Không calling through chính là cách một lớp middleware
-        #     "chặn" một hành động — xem harness/middleware.py.
-        return call(name, args)  # <- mặc định KHÔNG LÀM GÌ
+        if not self._spent(ctx):
+            return call(name, args)
+        # KHÔNG gọi `call(...)`: không calling through chính là cách một lớp
+        # middleware chặn một hành động. `ok=False` chứ không raise — agent
+        # phải sống sót để còn chốt FINAL bằng bằng chứng đang có.
+        ctx.state["budget_blocked"] = ctx.state.get("budget_blocked", 0) + 1
+        return ToolResult(
+            ok=False,
+            content="",
+            error=(
+                f"ngân sách công cụ đã cạn ({ctx.tools.calls}/{ctx.max_tool_calls}, "
+                f"dự trữ {self.reserve} lượt cho submit) — hãy trả lời ngay bằng "
+                "bằng chứng đang có"
+            ),
+        )

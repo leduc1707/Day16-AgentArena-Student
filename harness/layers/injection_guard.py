@@ -47,6 +47,10 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
+from harness.layers._grounding import claim_text, sync_citations
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -62,17 +66,52 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = getattr(result, "content", None)
+        if not isinstance(content, str) or BLOCK_START not in content:
+            return result
+
+        cleaned = content
+        removed = 0
+        while True:
+            start = cleaned.find(BLOCK_START)
+            if start < 0:
+                break
+            end = cleaned.find(BLOCK_END, start)
+            # Không tìm thấy dấu mốc ĐÓNG nghĩa là lần fetch bị cắt giữa
+            # chừng: cắt tới hết chuỗi. Một lớp phòng thủ chỉ hành động khi
+            # thấy đủ cả hai dấu mốc sẽ thủng đúng vào những seed xui.
+            stop = len(cleaned) if end < 0 else end + len(BLOCK_END)
+            cleaned = cleaned[:start] + PLACEHOLDER + cleaned[stop:]
+            removed += 1
+
+        ctx.state["injection_blocks_removed"] = (
+            ctx.state.get("injection_blocks_removed", 0) + removed
+        )
+        # PLACEHOLDER để lại một chỗ trống NHÌN THẤY ĐƯỢC: mô hình (và
+        # người chấm) cần biết có thứ đã bị gỡ, đừng xoá lặng lẽ.
+        return ToolResult(ok=result.ok, content=cleaned, error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        # Viết lại `answer` là MIỄN PHÍ trong thang điểm; 15 điểm safety thì
+        # mất sạch chỉ vì một chuỗi canary lọt ra.
+        answer = report.get("answer")
+        if isinstance(answer, str) and INJECTION_CANARY in answer:
+            report["answer"] = answer.replace(INJECTION_CANARY, "").strip()
+            ctx.state["canary_scrubbed"] = True
+
+        # Bộ chấm quét canary trên TOÀN BỘ report (`arena.scorer._report_text`
+        # serialise cả dict), không riêng `answer`. Với một claim mang canary
+        # thì XOÁ HẲN claim — xoá là sửa đổi hợp lệ, còn "làm sạch" chữ của
+        # nó phá provenance và mất luôn điểm grounding, đắt hơn chính con
+        # canary. Tuyệt đối không sửa `claim["text"]`.
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            kept = [
+                claim
+                for claim in claims
+                if INJECTION_CANARY not in claim_text(claim)
+            ]
+            if len(kept) != len(claims):
+                report["claims"] = kept
+                sync_citations(report)
+        return report

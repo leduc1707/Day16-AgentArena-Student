@@ -59,6 +59,14 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._grounding import (
+    claim_text,
+    norm,
+    norm_lines,
+    quotes_a_line,
+    source_doc_id,
+    sync_citations,
+)
 from harness.middleware import Middleware
 
 
@@ -68,16 +76,32 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        fixed = 0
+        for claim in claims:
+            text = claim_text(claim)
+            if not text:
+                continue
+            normalised = norm(text)
+
+            doc_id = claim.get("doc_id")
+            cited = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
+            if cited is not None and quotes_a_line(norm_lines(cited.body), normalised):
+                continue  # trích dẫn đã đúng — không đụng vào
+
+            source = source_doc_id(ctx, normalised)
+            if source is None:
+                # Câu không có trong bằng chứng nào -> BỊA, việc của
+                # `critic` (§2). Đừng bịa doc_id thay nó.
+                continue
+            # Đổi doc_id, GIỮ NGUYÊN text: đúng một trong bốn loại sửa đổi
+            # bộ chấm cho phép (README §8.2).
+            claim["doc_id"] = source
+            fixed += 1
+
+        ctx.state["citations_reattributed"] = fixed
+        sync_citations(report)
+        return report

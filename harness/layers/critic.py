@@ -70,7 +70,33 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._grounding import (
+    any_doc_quotes,
+    claim_text,
+    norm,
+    source_doc_id,
+    sync_citations,
+)
 from harness.middleware import Middleware
+
+#: Liên từ mô hình dùng để dán hai nửa câu của hai tài liệu khác nhau.
+FUSE_JOINERS = (" và ", " còn ", " trong khi ", " nhưng ")
+
+#: Bốn ngưỡng phạt của `arena/scorer.py`, chép lại chứ không import: chúng
+#: là hằng số công khai của luật chơi, nhưng một harness phụ thuộc vào bộ
+#: chấm sẽ chết khi vòng tính điểm chạy scorer ở tiến trình khác.
+MAX_CLAIM_CHARS = 500       # vượt -> OVERLONG,  phạt 1.00
+MAX_CLAIMS_PER_DOC = 4      # vượt -> REDUNDANT, phạt 1.00
+MAX_SCORED_CLAIMS = 10      # vượt -> EXCESS,    phạt 1.00
+
+#: `answer` thay thế khi không còn claim nào đứng vững. Viết lại `answer`
+#: là MIỄN PHÍ trong thang điểm — và một báo cáo không còn bằng chứng mà
+#: vẫn khẳng định chắc nịch là đúng thứ lớp này tồn tại để chặn.
+NO_EVIDENCE_ANSWER = (
+    "Không đủ căn cứ để trả lời. Các tài liệu đã đọc không chứa câu trả lời "
+    "cho câu hỏi này, hoặc bằng chứng thu được không đỡ được khẳng định nào. "
+    "Tôi không suy diễn số liệu khi không có nguồn xác nhận."
+)
 
 
 class Critic(Middleware):
@@ -78,17 +104,136 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def _split_fused(self, ctx, text: str):
+        """Trường hợp (c): tách câu ghép ở đúng chỗ dán, hoặc None.
+
+        Cắt đúng chỗ dán thì hai nửa vẫn là chữ của MÔ HÌNH — substring
+        của một câu mô hình đã viết vẫn qua được kiểm tra provenance. Cắt
+        sai thì một nửa vắt qua hai tài liệu và không quan sát nào chứa
+        nó, nên phép thử dưới đây tự loại chỗ cắt sai: cả hai nửa phải
+        nằm nguyên văn trong một tài liệu ĐÃ QUAN SÁT, và phải là HAI tài
+        liệu khác nhau.
+        """
+        for joiner in FUSE_JOINERS:
+            start = 0
+            while True:
+                cut = text.find(joiner, start)
+                if cut < 0:
+                    break
+                left, right = text[:cut], text[cut + len(joiner):]
+                left_doc = source_doc_id(ctx, norm(left))
+                right_doc = source_doc_id(ctx, norm(right))
+                if left_doc and right_doc and left_doc != right_doc:
+                    return [
+                        {"text": left, "doc_id": left_doc},
+                        {"text": right, "doc_id": right_doc},
+                    ]
+                start = cut + 1
+        return None
+
+    def _prune(self, ctx, claims: list) -> list:
+        """Bốn ngưỡng phạt của bộ chấm mà MockModel không bao giờ chạm.
+
+        `precision` là HỆ SỐ NHÂN trên cả 55 điểm grounding, và bốn loại
+        dưới đây đều bị phạt trọn 1.0 mỗi claim (`arena.scorer.
+        CLAIM_PENALTY_WEIGHTS`). Mock trích tối đa 4 câu ngắn từ 4 tài
+        liệu khác nhau nên không lần nào vượt — một mô hình thật nói
+        nhiều hơn thì vượt cả bốn, và mất điểm mà không có một cảnh báo
+        nào. Đây là lý do bộ lọc này không làm bảng luyện tập nhúc nhích
+        một điểm: nó không dành cho mock.
+
+        Chỉ dùng XOÁ và CẮT BỚT — hai trong bốn loại sửa đổi bộ chấm cho
+        phép. Không một ký tự nào của `claim["text"]` bị viết lại.
+        """
+        pruned: list = []
+        seen: set = set()
+        per_doc: dict = {}
+        for claim in claims:
+            text = claim_text(claim)
+
+            # OVERLONG: cắt bớt là hợp lệ — một substring vẫn là trích dẫn
+            # của chính dòng đó. Cắt ở đầu chuỗi thô: `norm` chỉ gộp
+            # khoảng trắng nên độ dài chuẩn hoá không bao giờ dài hơn.
+            if len(norm(text)) > MAX_CLAIM_CHARS:
+                claim["text"] = text = text[:MAX_CLAIM_CHARS]
+
+            # Claim TRÙNG NỘI DUNG không phủ thêm dữ kiện nào, nhưng vẫn
+            # đốt `allowance = số dữ kiện + 2`; claim kế tiếp lãnh trọn
+            # phạt `IRRELEVANT`. Đo được trên pub-08: precision 0.750.
+            key = norm(text)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+
+            # REDUNDANT: quá `MAX_CLAIMS_PER_DOC` claim trên cùng một tài liệu.
+            doc_id = claim.get("doc_id")
+            if isinstance(doc_id, str) and doc_id:
+                per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+                if per_doc[doc_id] > MAX_CLAIMS_PER_DOC:
+                    continue
+
+            pruned.append(claim)
+
+        # EXCESS: mọi claim sau claim thứ `MAX_SCORED_CLAIMS` là nhiễu
+        # không chấm được, và vẫn bị phạt.
+        dropped = len(claims) - len(pruned[:MAX_SCORED_CLAIMS])
+        if dropped:
+            ctx.state["critic_pruned"] = dropped
+        return pruned[:MAX_SCORED_CLAIMS]
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        claims = claims if isinstance(claims, list) else []
+
+        kept: list = []
+        dropped = 0
+        split = False
+        for claim in claims:
+            text = claim_text(claim)
+            # Câu CÓ trong bằng chứng nhưng gắn sai doc_id là
+            # MISATTRIBUTION — việc của `citation_checker` (§11), đã chạy
+            # trước lớp này. Ở đây chỉ hỏi một câu: kho tài liệu có thật sự
+            # nói câu này không?
+            if text and any_doc_quotes(ctx, norm(text)):
+                # ĐÃ THỬ VÀ ĐÃ BỎ: xoá claim có doc_id không tồn tại.
+                # Nghe rất hợp lý (`FABRICATED_CITATION` phạt 1.5, nặng
+                # nhất) nhưng ĐO ĐƯỢC LÀ LỖ: xoá hết claim thì nhánh
+                # "không còn gì" bật `abstain`, recall về 0 và honesty tụt
+                # 15 -> 5. Trên BRIEF_SLA với ba claim hỏng citation:
+                # giữ lại 46.13, xoá đi 29.26. Một claim bị phạt vẫn nuôi
+                # được 0.25 recall qua `stated_blob`; một claim bị xoá thì
+                # không nuôi gì cả. Để `citation_checker` gắn lại là đúng
+                # việc; xoá là làm quá.
+                kept.append(claim)  # giữ NGUYÊN VĂN, không sửa một ký tự
+                continue
+
+            halves = self._split_fused(ctx, text) if text else None
+            if halves is not None:
+                kept.extend(halves)
+                split = True
+                continue
+
+            # Không tài liệu nào nói câu này và cũng không tách được:
+            # đây là bịa. Một claim `HALLUCINATED` mất điểm precision VÀ
+            # mất trọn 15 điểm honesty, trên MỌI brief.
+            dropped += 1
+
+        ctx.state["critic_dropped"] = dropped
+        ctx.state["critic_split"] = split
+        kept = self._prune(ctx, kept)
+
+        if split:
+            # Đã nêu cả hai phía của một mâu thuẫn thì việc đúng tiếp theo
+            # là nói rằng mình không chọn bên nào.
+            report["abstain"] = True
+
+        if not kept:
+            report["claims"] = []
+            report["citations"] = []
+            report["abstain"] = True
+            report["answer"] = NO_EVIDENCE_ANSWER
+            return report
+
+        report["claims"] = kept
+        sync_citations(report)
+        return report
